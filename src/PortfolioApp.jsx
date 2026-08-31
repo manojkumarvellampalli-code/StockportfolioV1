@@ -22,6 +22,7 @@ const emptyStock = () => ({
   avgBuyPrice: "",
   currentPrice: "",
   highSinceBuy: "",
+  yearHigh: "",
   fundamentals: emptyFundamentals(),
   notes: "",
 });
@@ -495,18 +496,32 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
     setFetchMsg(null);
     try {
       const result = await fetchStockData(local.code, apiKey);
-      setLocal((l) => ({
-        ...l,
-        currentPrice: result.currentPrice || l.currentPrice,
-        highSinceBuy: result.high52 || l.highSinceBuy,
-        name: result.name || l.name,
-      }));
+      setLocal((l) => {
+        const cmp = parseFloat(result.currentPrice);
+        // Ratchet "high since buy" up only — never overwrite it with the
+        // broader 52-week high, since that can predate your purchase and
+        // falsely trigger SELL even while you're sitting on a real gain.
+        const prevHigh = parseFloat(l.highSinceBuy);
+        const avg = parseFloat(l.avgBuyPrice);
+        let nextHigh = l.highSinceBuy;
+        if (!isNaN(cmp)) {
+          const base = !isNaN(prevHigh) ? prevHigh : (!isNaN(avg) ? avg : cmp);
+          nextHigh = String(Math.max(base, cmp));
+        }
+        return {
+          ...l,
+          currentPrice: result.currentPrice || l.currentPrice,
+          highSinceBuy: nextHigh,
+          yearHigh: result.high52 || l.yearHigh,
+          name: result.name || l.name,
+        };
+      });
       const gotFundamentals = result.epsRaw !== null || result.patRaw !== null || result.marginRaw !== null;
       setFetchMsg({
         ok: true,
         msg: gotFundamentals
           ? "Price & fundamentals updated. Please verify fundamentals — the API's quarterly breakdown may not map directly to QoQ/YoY fields."
-          : "Price updated. This API doesn't reliably return quarterly EPS/PAT/margin trends — enter those manually below.",
+          : "Price updated. \"High since buy\" is tracked from your refreshes (won't include peaks before you started tracking) — adjust it manually if you know the real high. This API doesn't reliably return quarterly EPS/PAT/margin trends — enter those manually below.",
       });
     } catch (e) {
       setFetchMsg({ ok: false, msg: e.message });
@@ -602,8 +617,14 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
               <div>
                 <label className="text-xs text-stone-500 mb-1 block">High Since Buy</label>
                 <NumInput value={local.highSinceBuy} onChange={(v) => update("highSinceBuy", v)} placeholder="0.00" prefix="₹" />
+                {local.yearHigh && (
+                  <p className="text-[10px] text-stone-400 mt-1">52-wk high (ref only): ₹{local.yearHigh}</p>
+                )}
               </div>
             </div>
+            <p className="text-[11px] text-stone-400 mt-2">
+              "High Since Buy" auto-tracks upward each time you refresh live data — it won't include any peak from before you started tracking here. If you know the actual highest price since your purchase, enter it directly.
+            </p>
           </div>
 
           {/* Fundamentals */}
@@ -1002,10 +1023,19 @@ export default function PortfolioApp() {
       if (s.code) {
         try {
           const result = await fetchStockData(s.code, apiKey);
+          const cmp = parseFloat(result.currentPrice);
+          const prevHigh = parseFloat(s.highSinceBuy);
+          const avg = parseFloat(s.avgBuyPrice);
+          let nextHigh = s.highSinceBuy;
+          if (!isNaN(cmp)) {
+            const base = !isNaN(prevHigh) ? prevHigh : (!isNaN(avg) ? avg : cmp);
+            nextHigh = String(Math.max(base, cmp));
+          }
           updated[i] = {
             ...s,
             currentPrice: result.currentPrice || s.currentPrice,
-            highSinceBuy: result.high52 || s.highSinceBuy,
+            highSinceBuy: nextHigh,
+            yearHigh: result.high52 || s.yearHigh,
             name: result.name || s.name,
           };
           okCount++;
