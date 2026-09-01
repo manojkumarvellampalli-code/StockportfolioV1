@@ -48,10 +48,10 @@ function fundamentalFlags(f) {
   const patQoQ = num(f.patQoQ);
   const patYoY = num(f.patYoY);
 
-  // Combine QoQ/YoY pairs: positive if either available figure is > 0 (net positive momentum)
-  const epsPositive = [epsQoQ, epsYoY].some((v) => v !== null) && [epsQoQ, epsYoY].every((v) => v === null || v > 0);
-  const pmPositive = [pmQoQ, pmYoY].some((v) => v !== null) && [pmQoQ, pmYoY].every((v) => v === null || v > 0);
-  const patPositive = [patQoQ, patYoY].some((v) => v !== null) && [patQoQ, patYoY].every((v) => v === null || v > 0);
+  // Combine QoQ/YoY pairs: positive if every available figure is >= 0 (flat or growing counts as positive)
+  const epsPositive = [epsQoQ, epsYoY].some((v) => v !== null) && [epsQoQ, epsYoY].every((v) => v === null || v >= 0);
+  const pmPositive = [pmQoQ, pmYoY].some((v) => v !== null) && [pmQoQ, pmYoY].every((v) => v === null || v >= 0);
+  const patPositive = [patQoQ, patYoY].some((v) => v !== null) && [patQoQ, patYoY].every((v) => v === null || v >= 0);
 
   const epsNegative = [epsQoQ, epsYoY].some((v) => v !== null && v < 0);
   const pmNegative = [pmQoQ, pmYoY].some((v) => v !== null && v < 0);
