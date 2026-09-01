@@ -234,21 +234,103 @@ function parseApiResponse(data) {
   ]);
   const name = dig(data, ["companyName", "name", "companyProfile.companyName"]);
 
-  // Fundamentals are often nested under financials/quarterly results arrays;
-  // shape varies, so we try to pull the most recent quarter's EPS/PAT/margin
-  // trend if present, but this is best-effort — confirm before relying on it.
-  const eps = dig(data, ["keyMetrics.eps", "financials.eps", "eps"]);
-  const pat = dig(data, ["keyMetrics.pat", "financials.pat", "netProfit"]);
-  const margin = dig(data, ["keyMetrics.netProfitMargin", "financials.profitMargin", "profitMargin"]);
-
   return {
     currentPrice: currentPrice !== null ? String(currentPrice) : "",
     high52: high52 !== null ? String(high52) : "",
     name: name || "",
-    epsRaw: eps,
-    patRaw: pat,
-    marginRaw: margin,
     raw: data,
+  };
+}
+
+// ---------- Quarterly fundamentals fetch (Indian API /historical_stats) ----------
+// Docs: GET /historical_stats?stock_name=<name>&stats=quarter_results
+// Returns objects keyed by metric name -> { "Mon YYYY": value, ... } sorted
+// chronologically. We use this to compute real QoQ% and YoY% for EPS,
+// Operating Profit Margin (used as our "Profit Margin" proxy), and Net Profit
+// (used as our "PAT" proxy), rather than relying on the /stock endpoint,
+// which does not reliably expose quarterly trend data.
+async function fetchQuarterlyFundamentals(code, apiKey) {
+  if (!apiKey) throw new Error("No API key set. Add one in Settings.");
+  const url = `${API_BASE}/historical_stats?stock_name=${encodeURIComponent(code)}&stats=quarter_results`;
+  const res = await fetch(url, {
+    headers: { "x-api-key": apiKey },
+  });
+  if (!res.ok) {
+    if (res.status === 401 || res.status === 403) throw new Error("Invalid API key.");
+    if (res.status === 429) throw new Error("Rate limit / quota exceeded on your API plan.");
+    if (res.status === 404) throw new Error("Quarterly results not found for this code.");
+    throw new Error(`API error (${res.status}).`);
+  }
+  const data = await res.json();
+  return computeQuarterlyTrends(data);
+}
+
+// Parses "Mon YYYY" quarter-end labels (e.g. "Jun 2024") into a sortable key,
+// then computes the most recent QoQ% and YoY% change for each metric series.
+function parseQuarterLabel(label) {
+  const months = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
+  const [mon, yr] = label.split(" ");
+  if (!(mon in months) || !yr) return null;
+  return { year: parseInt(yr, 10), month: months[mon], sortKey: parseInt(yr, 10) * 12 + months[mon] };
+}
+
+function seriesToSortedEntries(series) {
+  if (!series || typeof series !== "object") return [];
+  return Object.entries(series)
+    .map(([label, value]) => ({ label, value: parseFloat(value), parsed: parseQuarterLabel(label) }))
+    .filter((e) => e.parsed !== null && !isNaN(e.value))
+    .sort((a, b) => a.parsed.sortKey - b.parsed.sortKey);
+}
+
+// Given a sorted series, returns { qoq, yoy } percent changes for the latest quarter.
+// QoQ compares the last two entries. YoY compares the last entry to the entry
+// ~12 months (i.e. the closest match to sortKey - 12) earlier.
+function latestChanges(entries) {
+  if (entries.length < 2) return { qoq: null, yoy: null };
+  const latest = entries[entries.length - 1];
+  const prevQ = entries[entries.length - 2];
+  const qoq = prevQ.value !== 0 ? ((latest.value - prevQ.value) / Math.abs(prevQ.value)) * 100 : null;
+
+  const targetSortKey = latest.parsed.sortKey - 12;
+  let yoyEntry = null;
+  let bestDiff = Infinity;
+  for (const e of entries) {
+    if (e === latest) continue;
+    const diff = Math.abs(e.parsed.sortKey - targetSortKey);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      yoyEntry = e;
+    }
+  }
+  // Only accept a YoY match within 2 months of exactly one year prior
+  const yoy = yoyEntry && bestDiff <= 2 && yoyEntry.value !== 0
+    ? ((latest.value - yoyEntry.value) / Math.abs(yoyEntry.value)) * 100
+    : null;
+
+  return { qoq, yoy, latestLabel: latest.label };
+}
+
+function computeQuarterlyTrends(data) {
+  // Field names as returned by /historical_stats?stats=quarter_results
+  const epsSeries = seriesToSortedEntries(data["EPS in Rs"]);
+  const patSeries = seriesToSortedEntries(data["Net Profit"]);
+  // Prefer explicit "Net Profit Margin" style field if present; otherwise
+  // fall back to Operating Profit Margin (OPM %) as the closest proxy the
+  // free-tier quarterly endpoint reliably returns.
+  const pmSeries = seriesToSortedEntries(data["Net Profit Margin %"] || data["NPM %"] || data["OPM %"]);
+
+  const eps = latestChanges(epsSeries);
+  const pat = latestChanges(patSeries);
+  const pm = latestChanges(pmSeries);
+
+  const hasAnyData = epsSeries.length > 0 || patSeries.length > 0 || pmSeries.length > 0;
+
+  return {
+    epsQoQ: eps.qoq, epsYoY: eps.yoy,
+    patQoQ: pat.qoq, patYoY: pat.yoy,
+    pmQoQ: pm.qoq, pmYoY: pm.yoy,
+    latestQuarterLabel: eps.latestLabel || pat.latestLabel || pm.latestLabel || null,
+    hasAnyData,
   };
 }
 
@@ -516,13 +598,31 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
           name: result.name || l.name,
         };
       });
-      const gotFundamentals = result.epsRaw !== null || result.patRaw !== null || result.marginRaw !== null;
-      setFetchMsg({
-        ok: true,
-        msg: gotFundamentals
-          ? "Price & fundamentals updated. Please verify fundamentals — the API's quarterly breakdown may not map directly to QoQ/YoY fields."
-          : "Price updated. \"High since buy\" is tracked from your refreshes (won't include peaks before you started tracking) — adjust it manually if you know the real high. This API doesn't reliably return quarterly EPS/PAT/margin trends — enter those manually below.",
-      });
+
+      // Fetch real quarterly EPS / PAT / margin trend data and auto-fill.
+      let fundMsg = "Price updated.";
+      try {
+        const trends = await fetchQuarterlyFundamentals(local.code, apiKey);
+        if (trends.hasAnyData) {
+          setLocal((l) => ({
+            ...l,
+            fundamentals: {
+              epsQoQ: trends.epsQoQ !== null ? trends.epsQoQ.toFixed(1) : l.fundamentals.epsQoQ,
+              epsYoY: trends.epsYoY !== null ? trends.epsYoY.toFixed(1) : l.fundamentals.epsYoY,
+              pmQoQ: trends.pmQoQ !== null ? trends.pmQoQ.toFixed(1) : l.fundamentals.pmQoQ,
+              pmYoY: trends.pmYoY !== null ? trends.pmYoY.toFixed(1) : l.fundamentals.pmYoY,
+              patQoQ: trends.patQoQ !== null ? trends.patQoQ.toFixed(1) : l.fundamentals.patQoQ,
+              patYoY: trends.patYoY !== null ? trends.patYoY.toFixed(1) : l.fundamentals.patYoY,
+            },
+          }));
+          fundMsg = `Price & quarterly fundamentals updated (latest quarter: ${trends.latestQuarterLabel || "n/a"}). Profit Margin uses Operating Profit Margin (OPM%) as a proxy if net margin isn't available — verify against Screener.in if in doubt.`;
+        } else {
+          fundMsg = "Price updated. No quarterly results data found for this stock — enter EPS/PM/PAT manually below.";
+        }
+      } catch (fundErr) {
+        fundMsg = `Price updated. Quarterly fundamentals fetch failed: ${fundErr.message}`;
+      }
+      setFetchMsg({ ok: true, msg: fundMsg });
     } catch (e) {
       setFetchMsg({ ok: false, msg: e.message });
     }
@@ -653,7 +753,7 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
                 </div>
               </div>
             </div>
-            <p className="text-[11px] text-stone-400 mt-2">Enter % change figures from the company's last 4 quarterly reports (e.g. Screener.in, NSE/BSE filings). Positive = growth, negative = decline.</p>
+            <p className="text-[11px] text-stone-400 mt-2">Auto-filled from the last quarterly results when you tap "Fetch live data" (verify against Screener.in). You can still edit any value manually — manual edits are kept until you refresh again.</p>
           </div>
 
           {/* Live preview */}
@@ -1006,6 +1106,8 @@ export default function PortfolioApp() {
 
   // Refreshes CMP / high / fundamentals for every holding, one request at a
   // time (sequential, with a short pause) to stay within free-tier rate limits.
+  // Each holding triggers two API calls: /stock (price) and /historical_stats
+  // (quarterly EPS/PAT/margin trend), so the pause also helps avoid bursts.
   const refreshAll = async () => {
     if (!apiKey) {
       setShowSettings(true);
@@ -1017,6 +1119,7 @@ export default function PortfolioApp() {
     setRefreshProgress({ done: 0, total: stocks.length });
     let okCount = 0;
     let failCount = 0;
+    let fundOkCount = 0;
     const updated = [...stocks];
     for (let i = 0; i < updated.length; i++) {
       const s = updated[i];
@@ -1039,16 +1142,39 @@ export default function PortfolioApp() {
             name: result.name || s.name,
           };
           okCount++;
+
+          // Small pause between the price call and the fundamentals call
+          // for the same stock, then fetch quarterly fundamentals.
+          await new Promise((r) => setTimeout(r, 200));
+          try {
+            const trends = await fetchQuarterlyFundamentals(s.code, apiKey);
+            if (trends.hasAnyData) {
+              updated[i] = {
+                ...updated[i],
+                fundamentals: {
+                  epsQoQ: trends.epsQoQ !== null ? trends.epsQoQ.toFixed(1) : s.fundamentals.epsQoQ,
+                  epsYoY: trends.epsYoY !== null ? trends.epsYoY.toFixed(1) : s.fundamentals.epsYoY,
+                  pmQoQ: trends.pmQoQ !== null ? trends.pmQoQ.toFixed(1) : s.fundamentals.pmQoQ,
+                  pmYoY: trends.pmYoY !== null ? trends.pmYoY.toFixed(1) : s.fundamentals.pmYoY,
+                  patQoQ: trends.patQoQ !== null ? trends.patQoQ.toFixed(1) : s.fundamentals.patQoQ,
+                  patYoY: trends.patYoY !== null ? trends.patYoY.toFixed(1) : s.fundamentals.patYoY,
+                },
+              };
+              fundOkCount++;
+            }
+          } catch {
+            // Fundamentals fetch failed for this stock — keep existing values, don't block price update.
+          }
         } catch {
           failCount++;
         }
       }
       setRefreshProgress({ done: i + 1, total: updated.length });
       setStocks([...updated]);
-      // small pause between calls to be gentle on free-tier rate limits
+      // small pause between stocks to be gentle on free-tier rate limits
       await new Promise((r) => setTimeout(r, 350));
     }
-    setRefreshSummary({ okCount, failCount, total: stocks.length });
+    setRefreshSummary({ okCount, failCount, total: stocks.length, fundOkCount });
     setRefreshing(false);
   };
 
@@ -1124,7 +1250,7 @@ export default function PortfolioApp() {
           {refreshing
             ? `Refreshing ${refreshProgress.done}/${refreshProgress.total}...`
             : refreshSummary
-            ? `Refreshed: ${refreshSummary.okCount}/${refreshSummary.total} updated${refreshSummary.failCount ? `, ${refreshSummary.failCount} failed` : ""}`
+            ? `Refreshed: ${refreshSummary.okCount}/${refreshSummary.total} updated (fundamentals: ${refreshSummary.fundOkCount}/${refreshSummary.total})${refreshSummary.failCount ? `, ${refreshSummary.failCount} failed` : ""}`
             : <>NSE · BSE — auto-detected from code {apiKey ? "· Live data connected" : "· Tap the wifi icon to connect live data"}</>}
         </p>
 
