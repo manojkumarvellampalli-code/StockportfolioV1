@@ -8,6 +8,18 @@ const API_KEY_STORAGE = "nb_api_key_v1";
 const SELL_DROP_PCT = 15;
 const BUY_MORE_GAIN_PCT = 20;
 const API_BASE = "https://stock.indianapi.in";
+// Quarterly results are only announced roughly every ~90 days (with up to a
+// ~45 day reporting lag), so there's no need to re-fetch them on every price
+// refresh. Cached fundamentals are reused until they're this many days old.
+const FUNDAMENTALS_STALE_DAYS = 30;
+
+function isFundamentalsStale(stock, days = FUNDAMENTALS_STALE_DAYS) {
+  if (!stock.fundamentalsFetchedAt) return true;
+  const fetchedAt = new Date(stock.fundamentalsFetchedAt).getTime();
+  if (isNaN(fetchedAt)) return true;
+  const ageDays = (Date.now() - fetchedAt) / (1000 * 60 * 60 * 24);
+  return ageDays >= days;
+}
 
 const emptyFundamentals = () => ({
   epsQoQ: "", epsYoY: "", pmQoQ: "", pmYoY: "", patQoQ: "", patYoY: "",
@@ -24,6 +36,8 @@ const emptyStock = () => ({
   highSinceBuy: "",
   yearHigh: "",
   fundamentals: emptyFundamentals(),
+  fundamentalsDetail: null,
+  fundamentalsFetchedAt: null,
   notes: "",
 });
 
@@ -195,12 +209,71 @@ function saveApiKey(key) {
   } catch {}
 }
 
+// ---------- API usage tracking (local only) ----------
+// indianapi.in doesn't expose a public "remaining credits" endpoint, so this
+// just counts requests made from this browser and resets at local midnight —
+// enough to help pace yourself against your plan's daily/credit limit, which
+// you can check exactly on your indianapi.in dashboard.
+const API_CALL_LOG_KEY = "nb_api_calls_v1";
+const LAST_REFRESH_KEY = "nb_last_refresh_v1";
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10);
+}
+
+function loadCallLog() {
+  try {
+    const raw = localStorage.getItem(API_CALL_LOG_KEY);
+    if (!raw) return { date: todayStr(), count: 0 };
+    const parsed = JSON.parse(raw);
+    if (parsed.date !== todayStr()) return { date: todayStr(), count: 0 };
+    return parsed;
+  } catch {
+    return { date: todayStr(), count: 0 };
+  }
+}
+
+function incrementCallLog() {
+  const log = loadCallLog();
+  log.count += 1;
+  try {
+    localStorage.setItem(API_CALL_LOG_KEY, JSON.stringify(log));
+  } catch {}
+  return log.count;
+}
+
+function loadLastRefresh() {
+  try {
+    return localStorage.getItem(LAST_REFRESH_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+function saveLastRefresh(iso) {
+  try {
+    localStorage.setItem(LAST_REFRESH_KEY, iso);
+  } catch {}
+}
+
+function formatRelativeTime(iso) {
+  if (!iso) return "";
+  const then = new Date(iso).getTime();
+  if (isNaN(then)) return "";
+  const mins = Math.floor((Date.now() - then) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  return new Date(iso).toLocaleDateString("en-IN", { day: "numeric", month: "short" });
+}
+
 // ---------- Live data fetch (Indian API - stock.indianapi.in) ----------
 // Docs: https://indianapi.in/documentation/indian-stock-market
 // Auth header: x-api-key
 async function fetchStockData(code, apiKey) {
   if (!apiKey) throw new Error("No API key set. Add one in Settings.");
   const url = `${API_BASE}/stock?name=${encodeURIComponent(code)}`;
+  incrementCallLog();
   const res = await fetch(url, {
     headers: { "x-api-key": apiKey },
   });
@@ -211,6 +284,7 @@ async function fetchStockData(code, apiKey) {
     throw new Error(`API error (${res.status}).`);
   }
   const data = await res.json();
+  saveLastRefresh(new Date().toISOString());
   return parseApiResponse(data);
 }
 
@@ -251,27 +325,49 @@ function parseApiResponse(data) {
 // which does not reliably expose quarterly trend data.
 async function fetchQuarterlyFundamentals(code, apiKey) {
   if (!apiKey) throw new Error("No API key set. Add one in Settings.");
-  const url = `${API_BASE}/historical_stats?stock_name=${encodeURIComponent(code)}&stats=quarter_results`;
-  const res = await fetch(url, {
-    headers: { "x-api-key": apiKey },
-  });
-  if (!res.ok) {
-    if (res.status === 401 || res.status === 403) throw new Error("Invalid API key.");
-    if (res.status === 429) throw new Error("Rate limit / quota exceeded on your API plan.");
-    if (res.status === 404) throw new Error("Quarterly results not found for this code.");
-    throw new Error(`API error (${res.status}).`);
+  const qUrl = `${API_BASE}/historical_stats?stock_name=${encodeURIComponent(code)}&stats=quarter_results`;
+  const rUrl = `${API_BASE}/historical_stats?stock_name=${encodeURIComponent(code)}&stats=ratios`;
+
+  const qRes = await fetch(qUrl, { headers: { "x-api-key": apiKey } });
+  incrementCallLog();
+  if (!qRes.ok) {
+    if (qRes.status === 401 || qRes.status === 403) throw new Error("Invalid API key.");
+    if (qRes.status === 429) throw new Error("Rate limit / quota exceeded on your API plan.");
+    if (qRes.status === 404) throw new Error("Quarterly results not found for this code.");
+    throw new Error(`API error (${qRes.status}).`);
   }
-  const data = await res.json();
-  return computeQuarterlyTrends(data);
+  const qData = await qRes.json();
+
+  // Annual ratios (Debt-to-Equity, ROE, ROCE) are supplementary/display-only —
+  // if this call fails, don't block the core quarterly fetch.
+  let rData = null;
+  try {
+    const rRes = await fetch(rUrl, { headers: { "x-api-key": apiKey } });
+    incrementCallLog();
+    if (rRes.ok) rData = await rRes.json();
+  } catch {
+    // ignore
+  }
+
+  return buildFundamentalsResult(qData, rData);
 }
 
 // Parses "Mon YYYY" quarter-end labels (e.g. "Jun 2024") into a sortable key,
 // then computes the most recent QoQ% and YoY% change for each metric series.
+// Indian fiscal-quarter mapping for standard quarter-end reporting months:
+// Jun -> Q1, Sep -> Q2, Dec -> Q3, Mar -> Q4. Fiscal year "FY26" runs
+// Apr 2025 - Mar 2026, so a Mar-ending quarter keeps that calendar year as
+// its FY, while Jun/Sep/Dec-ending quarters belong to the *next* calendar year's FY.
+const FISCAL_QUARTER_MAP = { Jun: 1, Sep: 2, Dec: 3, Mar: 4 };
+
 function parseQuarterLabel(label) {
   const months = { Jan: 0, Feb: 1, Mar: 2, Apr: 3, May: 4, Jun: 5, Jul: 6, Aug: 7, Sep: 8, Oct: 9, Nov: 10, Dec: 11 };
   const [mon, yr] = label.split(" ");
   if (!(mon in months) || !yr) return null;
-  return { year: parseInt(yr, 10), month: months[mon], sortKey: parseInt(yr, 10) * 12 + months[mon] };
+  const year = parseInt(yr, 10);
+  const q = FISCAL_QUARTER_MAP[mon] || null;
+  const fy = q === 4 ? year : year + 1;
+  return { year, month: months[mon], sortKey: year * 12 + months[mon], q, fy };
 }
 
 function seriesToSortedEntries(series) {
@@ -310,27 +406,108 @@ function latestChanges(entries) {
   return { qoq, yoy, latestLabel: latest.label };
 }
 
-function computeQuarterlyTrends(data) {
-  // Field names as returned by /historical_stats?stats=quarter_results
-  const epsSeries = seriesToSortedEntries(data["EPS in Rs"]);
-  const patSeries = seriesToSortedEntries(data["Net Profit"]);
+// Builds a per-metric table: the last 5 quarters as "Q{n}-{FY}" columns,
+// plus up to 2 years of same-quarter YoY% growth ("YOY26", "YOY25", ...).
+// Purely for display/analysis — evaluateStock() never reads this.
+function buildQuarterlyTable(entries) {
+  if (!entries || entries.length === 0) return { quarters: [], yoy: [] };
+  const desc = [...entries].sort((a, b) => b.parsed.sortKey - a.parsed.sortKey);
+
+  const quarters = desc.slice(0, 5).map((e) => ({
+    label: e.parsed.q ? `Q${e.parsed.q}-${String(e.parsed.fy).slice(-2)}` : e.label,
+    value: e.value,
+  }));
+
+  const findByQFy = (q, fy) => desc.find((e) => e.parsed.q === q && e.parsed.fy === fy);
+  const yoy = [];
+  const latest = desc[0];
+  if (latest && latest.parsed.q) {
+    const prevYear = findByQFy(latest.parsed.q, latest.parsed.fy - 1);
+    if (prevYear) {
+      const pct = prevYear.value !== 0 ? ((latest.value - prevYear.value) / Math.abs(prevYear.value)) * 100 : null;
+      yoy.push({ label: `YOY${String(latest.parsed.fy).slice(-2)}`, value: pct });
+      const prevPrevYear = findByQFy(latest.parsed.q, latest.parsed.fy - 2);
+      if (prevPrevYear) {
+        const pct2 = prevPrevYear.value !== 0 ? ((prevYear.value - prevPrevYear.value) / Math.abs(prevPrevYear.value)) * 100 : null;
+        yoy.push({ label: `YOY${String(latest.parsed.fy - 1).slice(-2)}`, value: pct2 });
+      }
+    }
+  }
+  return { quarters, yoy };
+}
+
+// Combines: (1) the decision-engine fields — EPS/Profit Margin/PAT QoQ & YoY,
+// exactly as before, still the ONLY inputs to the BUY MORE / SELL logic —
+// with (2) a full display table for analysis, which additionally includes
+// Debt-to-Equity, ROE, and ROCE. These extra ratios are NOT read anywhere
+// in evaluateStock(); they're informational only, per your request.
+function buildFundamentalsResult(qData, rData) {
+  const patEntries = seriesToSortedEntries(qData["Net Profit"]);
   // Prefer explicit "Net Profit Margin" style field if present; otherwise
   // fall back to Operating Profit Margin (OPM %) as the closest proxy the
   // free-tier quarterly endpoint reliably returns.
-  const pmSeries = seriesToSortedEntries(data["Net Profit Margin %"] || data["NPM %"] || data["OPM %"]);
+  const pmEntries = seriesToSortedEntries(qData["Net Profit Margin %"] || qData["NPM %"] || qData["OPM %"]);
+  const epsEntries = seriesToSortedEntries(qData["EPS in Rs"]);
 
-  const eps = latestChanges(epsSeries);
-  const pat = latestChanges(patSeries);
-  const pm = latestChanges(pmSeries);
+  const eps = latestChanges(epsEntries);
+  const pat = latestChanges(patEntries);
+  const pm = latestChanges(pmEntries);
 
-  const hasAnyData = epsSeries.length > 0 || patSeries.length > 0 || pmSeries.length > 0;
+  const patTable = buildQuarterlyTable(patEntries);
+  const pmTable = buildQuarterlyTable(pmEntries);
+  const epsTable = buildQuarterlyTable(epsEntries);
+
+  const tables = [patTable, pmTable, epsTable].filter((t) => t.quarters.length > 0);
+  const widest = (key) => (tables.length ? tables.reduce((a, b) => (b[key].length > a[key].length ? b : a)) : { [key]: [] });
+  const masterQuarters = widest("quarters").quarters.map((q) => q.label);
+  const masterYoy = widest("yoy").yoy.map((y) => y.label);
+
+  const alignRow = (table) => {
+    const byLabel = Object.fromEntries(table.quarters.map((q) => [q.label, q.value]));
+    const byYoyLabel = Object.fromEntries(table.yoy.map((y) => [y.label, y.value]));
+    return {
+      quarters: masterQuarters.map((l) => (l in byLabel ? byLabel[l] : null)),
+      yoy: masterYoy.map((l) => (l in byYoyLabel ? byYoyLabel[l] : null)),
+    };
+  };
+
+  // Debt-to-Equity / ROE / ROCE — these ratios are typically reported
+  // annually (not quarterly) by this API's free tier, so shown as trailing
+  // fiscal years rather than forced into the quarter columns above.
+  let deEntries = [], roeEntries = [], rocEntries = [];
+  if (rData) {
+    deEntries = seriesToSortedEntries(rData["Debt to Equity"] || rData["Debt / Equity"] || rData["Debt/Equity"]);
+    roeEntries = seriesToSortedEntries(rData["ROE %"] || rData["Return on Equity"] || rData["ROE"]);
+    rocEntries = seriesToSortedEntries(rData["ROCE %"] || rData["Return on Capital Employed"] || rData["ROCE"]);
+  }
+  const annualRow = (entries) =>
+    [...entries].sort((a, b) => b.parsed.sortKey - a.parsed.sortKey).slice(0, 3).map((e) => ({ label: e.label, value: e.value }));
+
+  const hasAnyData = patEntries.length > 0 || pmEntries.length > 0 || epsEntries.length > 0;
 
   return {
+    // Decision-engine fields — unchanged, still the only inputs to BUY MORE / SELL.
     epsQoQ: eps.qoq, epsYoY: eps.yoy,
     patQoQ: pat.qoq, patYoY: pat.yoy,
     pmQoQ: pm.qoq, pmYoY: pm.yoy,
     latestQuarterLabel: eps.latestLabel || pat.latestLabel || pm.latestLabel || null,
     hasAnyData,
+    // Full display table — for analysis only.
+    detail: {
+      quarterLabels: masterQuarters,
+      yoyLabels: masterYoy,
+      rows: {
+        PAT: alignRow(patTable),
+        "Profit Margin": alignRow(pmTable),
+        EPS: alignRow(epsTable),
+      },
+      annual: {
+        "Debt to Equity": annualRow(deEntries),
+        ROE: annualRow(roeEntries),
+        ROCE: annualRow(rocEntries),
+      },
+      hasAnnualRatios: deEntries.length > 0 || roeEntries.length > 0 || rocEntries.length > 0,
+    },
   };
 }
 
@@ -365,6 +542,90 @@ function FundamentalPill({ label, hasData, positive, negative }) {
       <Icon size={10} />
       {label}
     </span>
+  );
+}
+
+function FundamentalsTable({ detail }) {
+  if (!detail || (!detail.quarterLabels.length && !detail.hasAnnualRatios)) return null;
+
+  const rows = [
+    { key: "PAT", label: "PAT (₹ Cr)" },
+    { key: "Profit Margin", label: "Profit Margin (%)" },
+    { key: "EPS", label: "EPS (₹)" },
+  ];
+
+  return (
+    <div className="mt-3">
+      <div className="text-xs font-semibold text-stone-600 mb-1.5">Quarterly Fundamentals</div>
+      {detail.quarterLabels.length > 0 ? (
+        <div className="overflow-x-auto rounded-lg border border-stone-200">
+          <table className="text-[11px] w-full min-w-[540px]">
+            <thead>
+              <tr className="bg-stone-50 text-stone-500">
+                <th className="text-left px-2 py-1.5 font-medium sticky left-0 bg-stone-50">Metric</th>
+                {detail.quarterLabels.map((l) => (
+                  <th key={l} className="text-right px-2 py-1.5 font-medium whitespace-nowrap">{l}</th>
+                ))}
+                {detail.yoyLabels.map((l) => (
+                  <th key={l} className="text-right px-2 py-1.5 font-semibold text-teal-700 whitespace-nowrap">{l}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r) => {
+                const row = detail.rows[r.key];
+                if (!row) return null;
+                return (
+                  <tr key={r.key} className="border-t border-stone-100">
+                    <td className="text-left px-2 py-1.5 font-medium text-stone-700 sticky left-0 bg-white whitespace-nowrap">{r.label}</td>
+                    {row.quarters.map((v, i) => (
+                      <td key={i} className="text-right px-2 py-1.5 text-stone-600">{v !== null ? v.toFixed(1) : "—"}</td>
+                    ))}
+                    {row.yoy.map((v, i) => (
+                      <td key={i} className={`text-right px-2 py-1.5 font-medium ${v === null ? "text-stone-400" : v >= 0 ? "text-emerald-600" : "text-rose-600"}`}>
+                        {v !== null ? `${v >= 0 ? "+" : ""}${v.toFixed(1)}%` : "—"}
+                      </td>
+                    ))}
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      ) : (
+        <p className="text-[11px] text-stone-400">No quarterly series data returned for this stock yet.</p>
+      )}
+
+      {detail.hasAnnualRatios && (
+        <div className="mt-3">
+          <div className="text-xs font-semibold text-stone-600 mb-1.5">Annual Ratios (trailing years)</div>
+          <div className="overflow-x-auto rounded-lg border border-stone-200">
+            <table className="text-[11px] w-full min-w-[320px]">
+              <tbody>
+                {["Debt to Equity", "ROE", "ROCE"].map((key) => {
+                  const entries = detail.annual[key];
+                  if (!entries || entries.length === 0) return null;
+                  return (
+                    <tr key={key} className="border-t border-stone-100 first:border-t-0">
+                      <td className="text-left px-2 py-1.5 font-medium text-stone-700 whitespace-nowrap">{key}</td>
+                      {entries.map((e, i) => (
+                        <td key={i} className="text-right px-2 py-1.5 text-stone-600 whitespace-nowrap">
+                          <span className="text-stone-400 mr-1">{e.label}:</span>{e.value.toFixed(1)}{key !== "Debt to Equity" ? "%" : ""}
+                        </td>
+                      ))}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <p className="text-[10px] text-stone-400 mt-2">
+        For analysis only — the BUY MORE / SELL signal still uses just EPS, Profit Margin, and PAT QoQ/YoY (below), unchanged. Debt-to-Equity/ROE/ROCE are usually reported annually, not quarterly, so recent fiscal years are shown instead of quarters — verify against Screener.in.
+      </p>
+    </div>
   );
 }
 
@@ -543,7 +804,7 @@ function SettingsPanel({ apiKey, onSave, onClose }) {
 }
 
 // ---------- Stock Editor ----------
-function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey }) {
+function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey, onApiActivity }) {
   const [local, setLocal] = useState(stock);
   const [showCalc, setShowCalc] = useState(false);
   const [fetching, setFetching] = useState(false);
@@ -565,7 +826,7 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
     onClose();
   };
 
-  const fetchLive = async () => {
+  const fetchLive = async (forceFundamentals = false) => {
     if (!local.code) {
       setFetchMsg({ ok: false, msg: "Enter a stock code first." });
       return;
@@ -599,34 +860,47 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
         };
       });
 
-      // Fetch real quarterly EPS / PAT / margin trend data and auto-fill.
+      // Fetch real quarterly EPS / PAT / margin trend data and auto-fill,
+      // plus the full quarter-by-quarter table (and annual D/E, ROE, ROCE)
+      // for the analysis view below — but only if the cached copy is stale
+      // (or the person explicitly asked for a force refresh), since new
+      // quarterly results only come out roughly every 90 days.
       let fundMsg = "Price updated.";
-      try {
-        const trends = await fetchQuarterlyFundamentals(local.code, apiKey);
-        if (trends.hasAnyData) {
-          setLocal((l) => ({
-            ...l,
-            fundamentals: {
-              epsQoQ: trends.epsQoQ !== null ? trends.epsQoQ.toFixed(1) : l.fundamentals.epsQoQ,
-              epsYoY: trends.epsYoY !== null ? trends.epsYoY.toFixed(1) : l.fundamentals.epsYoY,
-              pmQoQ: trends.pmQoQ !== null ? trends.pmQoQ.toFixed(1) : l.fundamentals.pmQoQ,
-              pmYoY: trends.pmYoY !== null ? trends.pmYoY.toFixed(1) : l.fundamentals.pmYoY,
-              patQoQ: trends.patQoQ !== null ? trends.patQoQ.toFixed(1) : l.fundamentals.patQoQ,
-              patYoY: trends.patYoY !== null ? trends.patYoY.toFixed(1) : l.fundamentals.patYoY,
-            },
-          }));
-          fundMsg = `Price & quarterly fundamentals updated (latest quarter: ${trends.latestQuarterLabel || "n/a"}). Profit Margin uses Operating Profit Margin (OPM%) as a proxy if net margin isn't available — verify against Screener.in if in doubt.`;
-        } else {
-          fundMsg = "Price updated. No quarterly results data found for this stock — enter EPS/PM/PAT manually below.";
+      const stale = isFundamentalsStale(local);
+      if (!forceFundamentals && !stale) {
+        const ageDays = Math.floor((Date.now() - new Date(local.fundamentalsFetchedAt).getTime()) / (1000 * 60 * 60 * 24));
+        fundMsg = `Price updated. Fundamentals are still fresh (fetched ${ageDays === 0 ? "today" : `${ageDays}d ago`}) — reused cached data to save API credits. Use "Force refresh fundamentals" below if new results were just announced.`;
+      } else {
+        try {
+          const trends = await fetchQuarterlyFundamentals(local.code, apiKey);
+          if (trends.hasAnyData) {
+            setLocal((l) => ({
+              ...l,
+              fundamentals: {
+                epsQoQ: trends.epsQoQ !== null ? trends.epsQoQ.toFixed(1) : l.fundamentals.epsQoQ,
+                epsYoY: trends.epsYoY !== null ? trends.epsYoY.toFixed(1) : l.fundamentals.epsYoY,
+                pmQoQ: trends.pmQoQ !== null ? trends.pmQoQ.toFixed(1) : l.fundamentals.pmQoQ,
+                pmYoY: trends.pmYoY !== null ? trends.pmYoY.toFixed(1) : l.fundamentals.pmYoY,
+                patQoQ: trends.patQoQ !== null ? trends.patQoQ.toFixed(1) : l.fundamentals.patQoQ,
+                patYoY: trends.patYoY !== null ? trends.patYoY.toFixed(1) : l.fundamentals.patYoY,
+              },
+              fundamentalsDetail: trends.detail,
+              fundamentalsFetchedAt: new Date().toISOString(),
+            }));
+            fundMsg = `Price & quarterly fundamentals updated (latest quarter: ${trends.latestQuarterLabel || "n/a"}). Profit Margin uses Operating Profit Margin (OPM%) as a proxy if net margin isn't available — verify against Screener.in if in doubt.`;
+          } else {
+            fundMsg = "Price updated. No quarterly results data found for this stock — enter EPS/PM/PAT manually below.";
+          }
+        } catch (fundErr) {
+          fundMsg = `Price updated. Quarterly fundamentals fetch failed: ${fundErr.message}`;
         }
-      } catch (fundErr) {
-        fundMsg = `Price updated. Quarterly fundamentals fetch failed: ${fundErr.message}`;
       }
       setFetchMsg({ ok: true, msg: fundMsg });
     } catch (e) {
       setFetchMsg({ ok: false, msg: e.message });
     }
     setFetching(false);
+    if (onApiActivity) onApiActivity();
   };
 
   const evalResult = useMemo(() => evaluateStock(local), [local]);
@@ -684,7 +958,7 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
               <span className="text-xs font-semibold text-stone-600 uppercase tracking-wide">Position</span>
               <div className="flex items-center gap-3">
                 <button
-                  onClick={fetchLive}
+                  onClick={() => fetchLive(false)}
                   disabled={fetching}
                   className="text-[11px] font-medium text-teal-600 flex items-center gap-1 disabled:opacity-50"
                 >
@@ -729,7 +1003,25 @@ function StockEditor({ stock, onChange, onDelete, onClose, apiKey, onNeedApiKey 
 
           {/* Fundamentals */}
           <div>
-            <span className="text-xs font-semibold text-stone-600 uppercase tracking-wide block mb-2">Fundamentals — last 4 quarters trend (%)</span>
+            <div className="flex items-center justify-between mb-1">
+              {local.fundamentalsFetchedAt ? (
+                <span className="text-[10px] text-stone-400">
+                  Fundamentals fetched {formatRelativeTime(local.fundamentalsFetchedAt)} {isFundamentalsStale(local) && "(stale — will refetch on next \"Fetch live data\")"}
+                </span>
+              ) : (
+                <span className="text-[10px] text-stone-400">Fundamentals not fetched yet</span>
+              )}
+              <button
+                onClick={() => fetchLive(true)}
+                disabled={fetching}
+                className="text-[10px] font-medium text-teal-600 flex items-center gap-1 disabled:opacity-50 shrink-0"
+              >
+                {fetching ? <Loader2 size={11} className="animate-spin" /> : <RefreshCw size={11} />}
+                Force refresh fundamentals
+              </button>
+            </div>
+            <FundamentalsTable detail={local.fundamentalsDetail} />
+            <span className="text-xs font-semibold text-stone-600 uppercase tracking-wide block mb-2 mt-4">Fundamentals — last 4 quarters trend (%)</span>
             <div className="space-y-3">
               <div>
                 <div className="text-xs font-medium text-stone-500 mb-1">EPS Growth</div>
@@ -1082,6 +1374,21 @@ export default function PortfolioApp() {
   const [refreshing, setRefreshing] = useState(false);
   const [refreshProgress, setRefreshProgress] = useState({ done: 0, total: 0 });
   const [refreshSummary, setRefreshSummary] = useState(null);
+  const [apiCallsToday, setApiCallsToday] = useState(0);
+  const [lastRefreshedAt, setLastRefreshedAt] = useState("");
+  const [, forceTick] = useState(0);
+
+  const refreshUsageCounters = () => {
+    setApiCallsToday(loadCallLog().count);
+    setLastRefreshedAt(loadLastRefresh());
+  };
+
+  useEffect(() => {
+    refreshUsageCounters();
+    // Re-render every 30s so "Xm ago" stays roughly current without a manual refresh.
+    const id = setInterval(() => forceTick((t) => t + 1), 30000);
+    return () => clearInterval(id);
+  }, []);
 
   useEffect(() => {
     setStocks(loadPortfolio());
@@ -1120,6 +1427,7 @@ export default function PortfolioApp() {
     let okCount = 0;
     let failCount = 0;
     let fundOkCount = 0;
+    let fundCachedCount = 0;
     const updated = [...stocks];
     for (let i = 0; i < updated.length; i++) {
       const s = updated[i];
@@ -1143,27 +1451,35 @@ export default function PortfolioApp() {
           };
           okCount++;
 
-          // Small pause between the price call and the fundamentals call
-          // for the same stock, then fetch quarterly fundamentals.
-          await new Promise((r) => setTimeout(r, 200));
-          try {
-            const trends = await fetchQuarterlyFundamentals(s.code, apiKey);
-            if (trends.hasAnyData) {
-              updated[i] = {
-                ...updated[i],
-                fundamentals: {
-                  epsQoQ: trends.epsQoQ !== null ? trends.epsQoQ.toFixed(1) : s.fundamentals.epsQoQ,
-                  epsYoY: trends.epsYoY !== null ? trends.epsYoY.toFixed(1) : s.fundamentals.epsYoY,
-                  pmQoQ: trends.pmQoQ !== null ? trends.pmQoQ.toFixed(1) : s.fundamentals.pmQoQ,
-                  pmYoY: trends.pmYoY !== null ? trends.pmYoY.toFixed(1) : s.fundamentals.pmYoY,
-                  patQoQ: trends.patQoQ !== null ? trends.patQoQ.toFixed(1) : s.fundamentals.patQoQ,
-                  patYoY: trends.patYoY !== null ? trends.patYoY.toFixed(1) : s.fundamentals.patYoY,
-                },
-              };
-              fundOkCount++;
+          // Skip the fundamentals call entirely if the cached copy is still
+          // fresh (results only come out ~every 90 days) — saves credits.
+          if (!isFundamentalsStale(s)) {
+            fundCachedCount++;
+          } else {
+            // Small pause between the price call and the fundamentals call
+            // for the same stock, then fetch quarterly fundamentals.
+            await new Promise((r) => setTimeout(r, 200));
+            try {
+              const trends = await fetchQuarterlyFundamentals(s.code, apiKey);
+              if (trends.hasAnyData) {
+                updated[i] = {
+                  ...updated[i],
+                  fundamentals: {
+                    epsQoQ: trends.epsQoQ !== null ? trends.epsQoQ.toFixed(1) : s.fundamentals.epsQoQ,
+                    epsYoY: trends.epsYoY !== null ? trends.epsYoY.toFixed(1) : s.fundamentals.epsYoY,
+                    pmQoQ: trends.pmQoQ !== null ? trends.pmQoQ.toFixed(1) : s.fundamentals.pmQoQ,
+                    pmYoY: trends.pmYoY !== null ? trends.pmYoY.toFixed(1) : s.fundamentals.pmYoY,
+                    patQoQ: trends.patQoQ !== null ? trends.patQoQ.toFixed(1) : s.fundamentals.patQoQ,
+                    patYoY: trends.patYoY !== null ? trends.patYoY.toFixed(1) : s.fundamentals.patYoY,
+                  },
+                  fundamentalsDetail: trends.detail,
+                  fundamentalsFetchedAt: new Date().toISOString(),
+                };
+                fundOkCount++;
+              }
+            } catch {
+              // Fundamentals fetch failed for this stock — keep existing values, don't block price update.
             }
-          } catch {
-            // Fundamentals fetch failed for this stock — keep existing values, don't block price update.
           }
         } catch {
           failCount++;
@@ -1174,8 +1490,9 @@ export default function PortfolioApp() {
       // small pause between stocks to be gentle on free-tier rate limits
       await new Promise((r) => setTimeout(r, 350));
     }
-    setRefreshSummary({ okCount, failCount, total: stocks.length, fundOkCount });
+    setRefreshSummary({ okCount, failCount, total: stocks.length, fundOkCount, fundCachedCount });
     setRefreshing(false);
+    refreshUsageCounters();
   };
 
   const addFromRecommendation = (code) => {
@@ -1250,9 +1567,14 @@ export default function PortfolioApp() {
           {refreshing
             ? `Refreshing ${refreshProgress.done}/${refreshProgress.total}...`
             : refreshSummary
-            ? `Refreshed: ${refreshSummary.okCount}/${refreshSummary.total} updated (fundamentals: ${refreshSummary.fundOkCount}/${refreshSummary.total})${refreshSummary.failCount ? `, ${refreshSummary.failCount} failed` : ""}`
+            ? `Refreshed: ${refreshSummary.okCount}/${refreshSummary.total} updated (fundamentals: ${refreshSummary.fundOkCount} fetched, ${refreshSummary.fundCachedCount} cached)${refreshSummary.failCount ? `, ${refreshSummary.failCount} failed` : ""}`
             : <>NSE · BSE — auto-detected from code {apiKey ? "· Live data connected" : "· Tap the wifi icon to connect live data"}</>}
         </p>
+        {apiKey && (
+          <p className="text-teal-100/70 text-[10px] mt-0.5">
+            {apiCallsToday} API call{apiCallsToday !== 1 ? "s" : ""} today{lastRefreshedAt && ` · Last refreshed ${formatRelativeTime(lastRefreshedAt)}`} · Check exact quota on your indianapi.in dashboard
+          </p>
+        )}
 
         <div className="grid grid-cols-3 gap-2 mt-5">
           <div className="bg-white/10 backdrop-blur rounded-xl p-3">
@@ -1343,6 +1665,7 @@ export default function PortfolioApp() {
           onClose={() => setEditingStock(null)}
           apiKey={apiKey}
           onNeedApiKey={() => setShowSettings(true)}
+          onApiActivity={refreshUsageCounters}
         />
       )}
       {showImport && <ImportPanel onClose={() => setShowImport(false)} onImport={importStocks} />}
